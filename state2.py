@@ -55,6 +55,7 @@ end_score()
 
 import random
 import networky as nx
+from collections import Counter
 
 def d6():
     return int(random.random()*6)+1
@@ -65,12 +66,21 @@ class LazyWrap(object):
         self.action = action
         self.action_arg = action_arg
     def experiment(self):
+        '''
+        复制自己的agg_wrap引用（这个时候才复制以避免没有探索的节点浪费空间）
+        并用之前保存的action对象与配套的action_arg对其进行原地修改并返回。
+        '''
         agg_state = self.agg_wrap.agg_state.copy()
         # action.apply应该是原地处理
         self.action.apply(agg_state, self.action_arg)
         return AggWrap(agg_state= agg_state,
                        feature_extractor = self.agg_wrap.feature_extractor,
                        action_gen_list = self.agg_wrap.action_gen_list)
+    def describe(self):
+        '''
+        类似experiment，但是输出描述信息，用于用于与人交互和调试
+        '''
+        return self.action.describe(self.action_arg)
 
 class AggWrap(object):
     def __init__(self, agg_state = None, feature_extractor = None, action_gen_list = None):
@@ -104,9 +114,9 @@ class AggWrap(object):
         return self.feature_extractor.extract(self.agg_state)
     def control_side(self):
         '''
-        返回当前控制方
+        返回当前控制方的Id
         '''
-        return self.agg_state.control_side
+        return self.agg_state.control_side.id
     def is_end(self):
         '''
         这两个也是直接调用agg_state的方法
@@ -127,6 +137,8 @@ class AggState(object):
     def is_end(self):
         raise NotImplementedError
     def end_score(self):
+        raise NotImplementedError
+    def copy(self):
         raise NotImplementedError
 
         
@@ -154,6 +166,13 @@ class ActionGen(object):
     def apply(self, agg_state, action_arg):
         '''
         依照之前extract出来的action_arg对总状态agg_state进行inplace修改。
+        '''
+        raise NotImplementedError
+    def describe(self, action_arg):
+        '''
+        返回一个类字典描述本对象信息，主要用于和人交互，对AI不可见,
+        LazyWrap的describe方法就是直接用它保存的action辅以对应的
+        action_arg来调用这个方法
         '''
         raise NotImplementedError
 
@@ -197,6 +216,12 @@ class Location(object):
     def copy(self):
         return Location(id = self.id, shield = self.shield, end = self.end)
         
+class Side(object):
+    def __init__(self, id = None):
+        self.id = id
+    def copy(self):
+        return Side(id = self.id)
+        
 class LocationMap(object):
     '''
     创建一个这个对象来管理单位的位置
@@ -232,7 +257,8 @@ class LocationMap(object):
     def copy(self):
         lm = LocationMap()
         lm.unit_to_loc = self.unit_to_loc.copy()
-        lm.loc_to_unit = self.loc_to_unit.copy()
+        #lm.loc_to_unit = self.loc_to_unit.copy() # fuck,这个直接复制了列表引用都没看出来
+        lm.loc_to_unit = {key : vlist.copy() for key,vlist in self.loc_to_unit.items()}
         return lm
         
         
@@ -244,7 +270,7 @@ class GameAggState(AggState):
         AggState.__init__(self)
         
         self.meta_info = meta_info if meta_info != None else {}
-        self.side_list = side_list if side_list != None else [1,2]
+        self.side_list = side_list
         self.unit_list = unit_list
         self.location_list = location_list
         self.unit_location_map = unit_location_map
@@ -252,8 +278,10 @@ class GameAggState(AggState):
         self.phase = phase # phase取normal与solve damage两个状态
         self.control_side = control_side
         self.graph = graph
+        
         self.unit_map = {unit.id : unit for unit in unit_list}
         self.location_map = {loc.id : loc for loc in location_list}
+        self.side_map = {side.id : side for side in side_list}
     def copy(self):
         unit_list = [unit.copy() for unit in self.unit_list]
         unit_location_map = self.unit_location_map.copy()
@@ -261,8 +289,8 @@ class GameAggState(AggState):
         graph = self.graph # 不复制,应该是不变的
         turn = self.turn
         location_list = self.location_list # 不复制，应该不变
-        control_side = self.control_side
-        side_list = self.side_list
+        side_list = [side.copy() for side in self.side_list]
+        control_side = side_list[self.side_list.index(self.control_side)]
         phase = self.phase
         return GameAggState(unit_list = unit_list,
                             location_list = location_list,
@@ -291,6 +319,7 @@ class GameAggState(AggState):
         if self.side_list[1] == self.control_side:
             self.turn += 1
         self.control_side_flip()
+        self.side_resume(self.control_side)
     def unit_fire(self, unit1, unit2):
         # 这个条件检查比较复杂，省去，当做它就是对的
         unit1.m -= 1
@@ -313,13 +342,18 @@ class GameAggState(AggState):
     def unit_route(self, unit, loc):
         self.unit_move(unit, loc)
         unit.is_need_solve = False
+    def side_resume(self, side):
+        # 恢复side的所有单位状态
+        for unit in self.unit_list:
+            if unit.side == self.control_side.id:
+                unit.m = unit.M
     def moveable_unit(self):
         '''
         返回与当前控制方相同且移动力m大于等于1的单位
         '''
         rl = []
         for unit in self.unit_list:
-            if unit.side == self.control_side and unit.m >= 1 and unit.is_entered and not unit.is_removed:
+            if unit.side == self.control_side.id and unit.m >= 1 and unit.is_entered and not unit.is_removed:
                 rl.append(unit)
         return rl
     def need_solve_unit(self):
@@ -344,7 +378,7 @@ class GameAggState(AggState):
             return {'A':1,'B':0}
         return {'A':0,'B':1}
     def __str__(self):
-        head = 'Turn: {}  side: {}  phase: {}'.format(self.turn, self.control_side, self.phase)
+        head = 'Turn: {}  side: {}  phase: {}'.format(self.turn, self.control_side.id, self.phase)
         graph_text='''1-2-3-4
 | | | |
 5-6-7-8'''
@@ -380,7 +414,7 @@ class ActionFire(ActionGen):
             for nei_id in agg_state.graph.neighbors(loc_id):
                 for nei_unit_id in agg_state.unit_location_map.contain_loc(nei_id):
                     nei_unit = agg_state.unit_map[nei_unit_id]
-                    if nei_unit.side != agg_state.control_side:
+                    if nei_unit.side != agg_state.control_side.id:
                         pair_list.append((unit.id,nei_unit.id))
         return [(self,pair) for pair in pair_list]
     def apply(self, agg_state, action_arg):
@@ -391,6 +425,9 @@ class ActionFire(ActionGen):
         unit_id, nei_unit_id = action_arg
         unit, nei_unit = agg_state.unit_map[unit_id], agg_state.unit_map[nei_unit_id]
         agg_state.unit_fire(unit, nei_unit)
+    def describe(self, action_arg):
+        unit_id, nei_unit_id = action_arg
+        return {'type':'fire','text':'fire {} to {}'.format(unit_id, nei_unit_id)}
 
 class ActionMove(ActionGen):
     def generate(self, agg_state):
@@ -408,6 +445,9 @@ class ActionMove(ActionGen):
     def apply(self, agg_state, action_arg):
         unit_id,loc_id = action_arg
         agg_state.unit_move(agg_state.unit_map[unit_id], agg_state.location_map[loc_id])
+    def describe(self, action_arg):
+        unit_id,loc_id = action_arg
+        return {'type':'move','text':'move {} to {}'.format(unit_id,loc_id)}
         
 class ActionSkip(ActionGen):
     def generate(self, agg_state):
@@ -416,6 +456,8 @@ class ActionSkip(ActionGen):
         return [(self,())]
     def apply(self, agg_state, action_arg):
         agg_state.skip()
+    def describe(self, action_arg):
+        return {'type':'skip','text':'skip'}
                 
 class ActionSolve(ActionGen):
     def generate(self, agg_state):
@@ -427,7 +469,7 @@ class ActionSolve(ActionGen):
             pair_list.append(('hit',unit.id))
             loc_id = agg_state.unit_location_map.where_unit(unit.id)
             for nei_loc_id in agg_state.graph.neighbors(loc_id):
-                if agg_state.enter_permission(unit, agg_state.location_map[nei_loc_id]):
+                if unit.m >= 1 and agg_state.enter_permission(unit, agg_state.location_map[nei_loc_id]):
                     pair_list.append(('route', unit.id, nei_loc_id))
         return [(self, pair) for pair in pair_list]
     def apply(self, agg_state, action_arg):
@@ -442,6 +484,15 @@ class ActionSolve(ActionGen):
             #agg_state.unit_move(unit, loc)
             agg_state.unit_route(unit, loc)
             agg_state.goto_normal_phase()
+    def describe(self, action_arg):
+        if action_arg[0] == 'hit':
+            unit_id = action_arg[1]
+            return {'type':'solve','subtype':'hit',
+                    'text':'{} recieve hited'.format(unit_id)}
+        elif action_arg[0] == 'route':
+            unit_id, loc_id = action_arg[1:]
+            return {'type':'solve','subtype':'route',
+                    'text':'route {} to {}'.format(unit_id, loc_id)}
         
 class ActionEnter(ActionGen):
     def generate(self, agg_state):
@@ -458,7 +509,11 @@ class ActionEnter(ActionGen):
     def apply(self, agg_state, action_arg):
         unit_id = action_arg[0]
         unit = agg_state.unit_map[unit_id]
-        unit_location_map.enter(unit_id, unit.enter_location)
+        agg_state.unit_location_map.enter(unit_id, unit.enter_location)
+        unit.is_entered = True
+    def describe(self, action_arg):
+        unit_id = action_arg[0]
+        return {'type':'enter','text':'enter unit {}'.format(unit_id)}
 # test
 
 link_table=[(1,2),
@@ -519,7 +574,8 @@ unit_list = None, location_list = None,
                  turn = None, control_side = None, graph = None,
                  side_list = None, phase = None
 '''
-side_list = ['A','B']
+#side_list = ['A','B']
+side_list = [Side('A'),Side('B')]
 
 unit_list = []
 for unit_id,unit_value in unit_map.items():
@@ -560,6 +616,7 @@ action_enter = ActionEnter()
 action_gen_list = [action_fire, action_move, action_skip, action_solve,
                    action_enter]
 
+# 注意agg_wrap构造器本身没把这些对象复制一遍
 agg_wrap = AggWrap(agg_state = game_agg_state, 
                    feature_extractor = feature_extractor,
                    action_gen_list = action_gen_list)
@@ -576,7 +633,115 @@ agg_wrap2 = succ_list[0].experiment()
 iter_max = 1000
 agg_wrap_walk = agg_wrap.copy()
 for i in range(iter_max):
+    #print(i)
     if agg_wrap_walk.is_end():
         break
     else:
         agg_wrap_walk = random.choice(agg_wrap_walk.get_succ()).experiment()
+
+agg_wrap_walk = agg_wrap.copy()
+for i in range(iter_max):
+    #print(i)
+    if agg_wrap_walk.is_end():
+        break
+    else:
+        agg_wrap_walk = random.choice(agg_wrap_walk.get_succ()).experiment()
+
+        
+def walk_experiment(agg_wrap_base, itermax = 1000):
+    agg_wrap = agg_wrap_base.copy()
+    for i in range(itermax):
+        if agg_wrap.is_end():
+            break
+        else:
+            agg_wrap = random.choice(agg_wrap.get_succ()).experiment()
+    return agg_wrap
+            
+def walk_experiment_test(agg_wrap_base, size ,once_itermax = 1000):
+    return [walk_experiment(agg_wrap_base, itermax = once_itermax) for i in range(size)]
+'''
+# flat test
+print("flat test")
+
+agg_wrap_base = agg_wrap
+once_itermax = 1000
+size = 1000
+for i in range(size):
+    #print(i)
+    agg_wrap_test = agg_wrap_base.copy()
+    for j in range(once_itermax):
+        #print(j)
+        if agg_wrap_test.is_end():
+            break
+        else:
+            agg_wrap_test = random.choice(agg_wrap_test.get_succ()).experiment()
+            
+print("succ end")
+'''
+def loss_test(agg_wrap_base, size):
+    wraps = walk_experiment_test(agg_wrap_base, 1000)
+    
+    loss_l = []
+    for wrap in wraps:
+        a,b = 0,0
+        for unit in wrap.agg_state.unit_list:
+            if unit.is_removed:
+                if unit.side == 'A':
+                    a += 1
+                else:
+                    b += 1
+            loss_l.append((a,b))
+    
+    return Counter(loss_l)
+    
+def AI_run_until_control_side_changed(agg_wrap_base,itermax = 1000):
+    '''
+    让AI控制（随机乱走）直到控制方变动
+    '''
+    control_side = agg_wrap_base.control_side()
+    
+    agg_wrap = agg_wrap_base.copy()
+    
+    for i in range(itermax):
+        if agg_wrap.control_side() != control_side:
+            return agg_wrap
+        agg_wrap = random.choice(agg_wrap.get_succ()).experiment()
+    raise RuntimeError('iters over itermax limit')
+    
+def player_run_until_control_side_changed(agg_wrap_base, exit_command = None):
+    if exit_command == None:
+        exit_command = {'exit','quit','e','q'}
+    control_side = agg_wrap_base.control_side()
+    
+    agg_wrap = agg_wrap_base.copy()
+    
+    while agg_wrap.control_side() == control_side:
+        print(agg_wrap.agg_state.__str__())
+        print('\n')
+        succs = agg_wrap.get_succ()
+        for i,succ in enumerate(succs):
+            print('{id}. {text}'.format(id = i,text = succ.describe()['text']))
+        inp = input('player>')
+        if inp in exit_command:
+            raise KeyboardInterrupt
+        index = int(inp)
+        agg_wrap = succs[index].experiment()
+    return agg_wrap
+        
+def run_game(agg_wrap_base, side_control_map):
+    '''
+    side_control_map 是字典，映射control_side为AI_run_until_control_side_changed
+    这样的函数
+    '''
+    agg_wrap = agg_wrap_base.copy()
+        
+    while not agg_wrap.is_end():
+        control_method = side_control_map[agg_wrap.control_side()] # "player" or "AI"
+        agg_wrap = control_method(agg_wrap)
+    return agg_wrap
+    
+def run_test(agg_wrap_base, sideA = 'player', sideB = 'AI'):
+    side_control_map = {'player':player_run_until_control_side_changed,
+                        'AI':AI_run_until_control_side_changed}
+    return run_game(agg_wrap_base, {'A':side_control_map[sideA],
+                                    'B':side_control_map[sideB]})
