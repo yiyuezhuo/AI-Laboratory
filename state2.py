@@ -56,6 +56,7 @@ end_score()
 import random
 import networky as nx
 from collections import Counter
+from itertools import chain
 
 def d6():
     return int(random.random()*6)+1
@@ -502,7 +503,7 @@ class ActionEnter(ActionGen):
         pair_list = []
         for unit in agg_state.unit_list:
             #unit.is_
-            if not unit.is_entered and agg_state.turn >= unit.enter_time:
+            if not unit.is_entered and agg_state.turn >= unit.enter_time and agg_state.control_side.id == unit.side:
                 if agg_state.enter_permission(unit, agg_state.location_map[unit.enter_location]):
                     pair_list.append((unit.id,))
         return [(self,pair) for pair in pair_list]
@@ -514,6 +515,25 @@ class ActionEnter(ActionGen):
     def describe(self, action_arg):
         unit_id = action_arg[0]
         return {'type':'enter','text':'enter unit {}'.format(unit_id)}
+        
+class VarFeatureExtractor(FeatureExtractor):
+    def extract(self, agg_state):
+        unit_info_vector = []
+        for unit in agg_state.unit_list:
+            is_entered = 1 if unit.is_entered else 0
+            is_removed = 1 if unit.is_removed else 0
+            movement   = unit.m
+            if unit.is_entered and not unit.is_removed:
+                loc_id = agg_state.unit_location_map.where_unit(unit.id)
+            else:
+                loc_id = None
+            loc_seq = [0 for i in range(8)]
+            if loc_id != None:
+                loc_seq[loc_id-1] = 1
+            vector = [is_entered,is_removed,movement] + loc_seq
+            unit_info_vector.append(vector)
+        return tuple(chain(*unit_info_vector))
+
 # test
 
 link_table=[(1,2),
@@ -605,7 +625,8 @@ game_agg_state = GameAggState(unit_list = unit_list, location_list = location_li
                               turn = 1, control_side = side_list[0], graph = graph,
                               side_list = side_list, phase = 'normal')
                               
-feature_extractor = FeatureExtractor()
+#feature_extractor = FeatureExtractor()
+var_feature_extractor = VarFeatureExtractor()
 
 action_fire = ActionFire()
 action_move = ActionMove()
@@ -618,7 +639,7 @@ action_gen_list = [action_fire, action_move, action_skip, action_solve,
 
 # 注意agg_wrap构造器本身没把这些对象复制一遍
 agg_wrap = AggWrap(agg_state = game_agg_state, 
-                   feature_extractor = feature_extractor,
+                   feature_extractor = var_feature_extractor,
                    action_gen_list = action_gen_list)
                    
 succ_list = []
@@ -690,7 +711,7 @@ def loss_test(agg_wrap_base, size):
                     a += 1
                 else:
                     b += 1
-            loss_l.append((a,b))
+        loss_l.append((a,b))
     
     return Counter(loss_l)
     
@@ -707,6 +728,8 @@ def AI_run_until_control_side_changed(agg_wrap_base,itermax = 1000):
             return agg_wrap
         agg_wrap = random.choice(agg_wrap.get_succ()).experiment()
     raise RuntimeError('iters over itermax limit')
+    
+
     
 def player_run_until_control_side_changed(agg_wrap_base, exit_command = None):
     if exit_command == None:
@@ -727,6 +750,18 @@ def player_run_until_control_side_changed(agg_wrap_base, exit_command = None):
         index = int(inp)
         agg_wrap = succs[index].experiment()
     return agg_wrap
+    
+def run_until_control_side_changed(func_map_agg_wrap_to_agg_wrap):
+    def _run_until_control_side_changed(agg_wrap_base):
+        
+        agg_wrap = agg_wrap_base.copy()
+        control_side = agg_wrap_base.control_side()
+        
+        while agg_wrap.control_side() == control_side:
+            agg_wrap = func_map_agg_wrap_to_agg_wrap(agg_wrap)
+        
+        return agg_wrap
+    return _run_until_control_side_changed
         
 def run_game(agg_wrap_base, side_control_map):
     '''
@@ -745,3 +780,81 @@ def run_test(agg_wrap_base, sideA = 'player', sideB = 'AI'):
                         'AI':AI_run_until_control_side_changed}
     return run_game(agg_wrap_base, {'A':side_control_map[sideA],
                                     'B':side_control_map[sideB]})
+                                    
+def UCT_choose_best(agg_wrap, raw_history,size = 1,priori = 0.5):
+    control_side = agg_wrap.control_side()
+    #raw_list.append(agg_wrap.to_raw())
+    
+    succ_list = agg_wrap.get_succ()
+    score_list = []
+    for succ in succ_list:
+        score = 0
+        for i in range(size):
+            raw = succ.experiment().to_raw()
+            if raw in raw_history:
+                score += raw_history[raw][control_side]/sum(raw_history[raw].values())
+            else:
+                score += priori
+        score_list.append(score/size)
+    succ_choose = succ_list[score_list.index(max(score_list))]
+    return succ_choose.experiment()
+
+                                    
+def UCTlike(agg_wrap_base, raw_history, size = 1, priori = 0.5):
+    '''
+    agg_wrap_base 总封装基对象，会内部复制
+    raw_history 随机试验反传时会更新，搜索时会参考其信息
+    size 探索一个节点的次数,因为是随机的可能探索结果不一样
+    priori 是一个未探索过的节点胜率的先验概率。
+    
+    该函数会探索一次树，多次探索应多次调用此函数.
+    这个函数并不返回任何东西，它修改raw_history的状态
+    '''
+    agg_wrap = agg_wrap_base.copy()
+    raw_list = []
+    while not agg_wrap.is_end():
+        
+        raw_list.append(agg_wrap.to_raw())
+        
+        agg_wrap = UCT_choose_best(agg_wrap, raw_history, size = size, priori = priori)
+        
+    score_map = agg_wrap.end_score()
+    
+    for raw in raw_list:
+        if raw not in raw_history:
+            raw_history[raw] = score_map.copy()
+        else:
+            for side_id,side_score in score_map.items():
+                raw_history[raw][side_id] += side_score
+    
+def AI_play_self(agg_wrap_base, raw_history, explore_size = 10, UCTlike_size = 1, UCTlike_priori = 0.5):
+    '''
+    AI将自我对弈，每轮先探索explore_size次数。
+    直到一局下完
+    '''
+    agg_wrap = agg_wrap_base.copy()
+    while not agg_wrap.is_end():
+        for i in range(explore_size):
+            UCTlike(agg_wrap, raw_history, size = UCTlike_size, priori = UCTlike_priori)
+        # 探索与的确做出决定是否使用不同参数更佳待察
+        agg_wrap = UCT_choose_best(agg_wrap, raw_history, size = UCTlike_size, priori = UCTlike_priori)
+        
+def AI_play_self_n(agg_wrap_base, raw_history = None, n = 10, verbose = True):
+    if raw_history == None:
+        raw_history = {}
+    for i in range(n):
+        AI_play_self(agg_wrap_base, raw_history)
+        if verbose:
+            # 如果AI有效的话该比例应该收敛于某个数
+            print("AI played {}/{} ".format(i+1,n))
+            origin_history = raw_history[agg_wrap_base.to_raw()]
+            print(origin_history)
+            print('P(A)={}'.format(origin_history['A']/sum(origin_history.values())))
+            print('searched state {}'.format(len(raw_history)))
+    return raw_history
+
+'''
+# 意料之中的迭代了60多M数据然而好像并没有什么卵用      
+UCTlike_run_until_control_side_changed = run_until_control_side_changed(lambda agg_wrap:UCT_choose_best(agg_wrap,raw_history = raw_history))
+run_game(agg_wrap,{'A':UCTlike_run_until_control_side_changed,'B':player_run_until_control_side_changed})
+'''
