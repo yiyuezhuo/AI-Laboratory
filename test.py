@@ -11,6 +11,7 @@ from collections import Counter
 #from itertools import chain
 
 from sihang_s1 import agg_wrap
+from util import pickle_dump,pickle_load
 
     
 '''
@@ -142,9 +143,7 @@ def run_test(agg_wrap_base, sideA = 'player', sideB = 'AI'):
                                     'B':side_control_map[sideB]})
                                     
 def UCT_choose_best(agg_wrap, raw_history, size = 1, priori = 0.5):
-    '''
-    根据钦定
-    '''
+    
     control_side = agg_wrap.control_side()
     #raw_list.append(agg_wrap.to_raw())
     
@@ -218,7 +217,7 @@ def AI_play_self_n(agg_wrap_base, raw_history, n = 10, verbose = True, **kwargs)
 '''
 # 意料之中的迭代了60多M数据然而好像并没有什么卵用      
 UCTlike_run_until_control_side_changed = run_until_control_side_changed(lambda agg_wrap:UCT_choose_best(agg_wrap,raw_history = raw_history))
-run_game(agg_wrap,{'A':UCTlike_run_until_control_side_changed,'B':player_run_until_control_side_changed})
+run_game(agg_wrap,{0 : UCTlike_run_until_control_side_changed, 1 : player_run_until_control_side_changed})
 '''
 
 def raw_history_to_dataframe(raw_history, agg_wrap):
@@ -227,12 +226,14 @@ def raw_history_to_dataframe(raw_history, agg_wrap):
     for feature, result in raw_history.items():
         mat.append(feature + tuple(result))
     df = pandas.DataFrame(mat)
-    df.columns = agg_wrap.feature_extractor.describe(agg_wrap.agg_state)['header']
+    df.columns = agg_wrap.feature_extractor.describe(agg_wrap.agg_state)['header'] + ('v1','v2')
     return df
     
 def raw_history_to_csv(raw_history, agg_wrap, output_name):
     df = raw_history_to_dataframe(raw_history, agg_wrap)
     df.to_csv(output_name)
+    
+
     
 '''
 交叉比较框架
@@ -243,4 +244,67 @@ def raw_history_to_csv(raw_history, agg_wrap, output_name):
 A胜率，p1自己对弈时A胜率与p0操作的A与p1操作的B的A胜率与p1操作的A与p0操作
 的A的A胜率。比较这五个值，相比能比较清楚的看出两个参数的优劣。此方法
 也可以推广到比较不同方式生成的AI的优劣。
+'''
+
+def cross_analyse(agg_wrap, raw_history_list, priori_list, size = 100):
+    '''
+    以对应的raw_history与priori生成的决策函数进行上述交叉检验
+    size指定一个特定组合的实验次数。
+    对比
+    AI_run_until_control_side_changed
+    UCTlike_choose1
+    UCTlike_choose2
+    三个决策函数在与自己对弈与分别对弈的3 * 3种情况中的A方胜率。
+    胜率矩阵V_{ij}项表示i扮演A方而j扮演B方时的A方胜率，所以并不是对称的
+    '''
+    AI_list = [AI_run_until_control_side_changed]
+    for raw_history,priori in zip(raw_history_list,priori_list):
+        UCTlike_choose = run_until_control_side_changed(lambda agg_wrap:UCT_choose_best(agg_wrap,raw_history = raw_history, priori = priori))
+        AI_list.append(UCTlike_choose)
+    #UCTlike_choose1 = run_until_control_side_changed(lambda agg_wrap:UCT_choose_best(agg_wrap,raw_history = raw_history1, priori = priori1))
+    #UCTlike_choose2 = run_until_control_side_changed(lambda agg_wrap:UCT_choose_best(agg_wrap,raw_history = raw_history2, priori = priori2))
+    ##run_game(agg_wrap,{'A':UCTlike_run_until_control_side_changed,'B':player_run_until_control_side_changed})
+    
+    #AI_list = [AI_run_until_control_side_changed, UCTlike_choose1, UCTlike_choose2]
+    mat = []
+    for AI_A in AI_list:
+        row = []
+        for AI_B in AI_list:
+            vs = 0
+            for i in range(size):
+                agg_wrap_end = run_game(agg_wrap,{0 : AI_A, 1 : AI_B})
+                vs += agg_wrap_end.end_score()[0]
+            row.append(vs/size)
+        mat.append(row)
+    return mat
+    
+'''
+[[0.194, 0.681, 0.709], 
+ [0.585, 0.605, 0.493], 
+ [0.578, 0.696, 0.573]]
+完全随机,priori=0.1,priori=0.3 100次训练三个AI的交叉矩阵 size=1000
+
+很惭愧，光从矩阵上看，似乎只能得出训练之后的AI还不如随机乱走的AI强。
+
+我本人测试感觉AI就会疯狂射击，根本不保留自己的mp，也往往不知道要进场援军
+遇到结算也往往秘制选择移除自己单位.随机乱走时sideB可能会把自己单位移到A方
+不能直接碰到的地方，然后就GG了。因为貌似AI只会对射。而对追击知之甚少。
+
+纵向比较（内存药丸）
+
+[[0.178, 0.681, 0.673], 
+ [0.597, 0.569, 0.56], 
+ [0.614, 0.497, 0.494]]
+ 
+为完全随机 priori=0.3 训练100轮，200轮的结果 size = 1000
+貌似更多训练对抗随机稍微强一点？然而对抗自己反而变弱？。。。意义不明，感觉
+代码是不是写错了
+
+[[0.192, 0.688, 0.684, 0.689],
+ [0.592, 0.623, 0.645, 0.626],
+ [0.588, 0.656, 0.627, 0.615],
+ [0.601, 0.641, 0.625, 0.638]]
+
+是完全随机，priori=0.1 训练100轮，200轮，300轮 size =1000的结果
+
 '''
